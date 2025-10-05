@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
@@ -95,6 +96,7 @@ class ProxyApp:
         self.items = []           # list of dicts: {path, qty}
         self.thumb_cache = {}     # path -> PhotoImage
         self.tiles = []           # per-item tile widgets (for fast qty updates)
+        self._current_cols = None
 
         # Toolbar (tiny, simple)
         self._build_toolbar()
@@ -140,10 +142,13 @@ class ProxyApp:
         self.inner.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
+        # Enable wheel/trackpad scrolling when pointer is over the canvas
+        self.canvas.bind("<Enter>", self._activate_wheel)
+        self.canvas.bind("<Leave>", self._deactivate_wheel)
+
         # Drag & drop onto the canvas
         if DND_AVAILABLE:
             self.canvas.drop_target_register("DND_Files")
-            # Use constant from tkinterdnd2 if available
             try:
                 from tkinterdnd2 import DND_FILES
                 self.canvas.drop_target_register(DND_FILES)
@@ -155,6 +160,50 @@ class ProxyApp:
         statusbar = ttk.Frame(self.root)
         statusbar.pack(fill="x")
         ttk.Label(statusbar, textvariable=self.status, anchor="w").pack(side="left", padx=10, pady=6)
+
+    # ---- Wheel/trackpad scrolling ----
+    def _activate_wheel(self, _evt=None):
+        # Windows & macOS use <MouseWheel>
+        if sys.platform == "darwin" or sys.platform.startswith("win"):
+            self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Linux/X11 typically uses Button-4/5
+        if sys.platform.startswith("linux"):
+            self.canvas.bind("<Button-4>", self._on_linux_wheel)
+            self.canvas.bind("<Button-5>", self._on_linux_wheel)
+
+    def _deactivate_wheel(self, _evt=None):
+        if sys.platform == "darwin" or sys.platform.startswith("win"):
+            self.root.unbind_all("<MouseWheel>")
+        if sys.platform.startswith("linux"):
+            self.canvas.unbind("<Button-4>")
+            self.canvas.unbind("<Button-5>")
+
+    def _on_mousewheel(self, event):
+        # Normalize delta across platforms
+        if sys.platform == "darwin":
+            # On macOS, delta is already in small steps; invert for natural scroll
+            self.canvas.yview_scroll(-1 * int(event.delta), "units")
+        else:
+            # Windows: event.delta is multiples of 120
+            self.canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+
+    def _on_linux_wheel(self, event):
+        if event.num == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(1, "units")
+
+    # ---- Reflow helper ----
+    def _force_reflow_after_idle(self):
+        """Measure the actual canvas width after Tk has settled, then re-grid."""
+        def _do():
+            self.inner.update_idletasks()
+            w = self.canvas.winfo_width()
+            if w <= 1:
+                w = max(300, self.root.winfo_width() - 20)
+            self._current_cols = None
+            self._relayout_columns(w)
+        self.root.after_idle(_do)
 
     # ---- DnD and adding files ----
     def _on_drop_files(self, event):
@@ -213,6 +262,7 @@ class ProxyApp:
                     self.items.append({"path": p, "qty": 1})
                     added += 1
         self._render_tiles_full()
+        self._force_reflow_after_idle()
         if added:
             self.status.set(f"Added {added} image(s).")
 
@@ -257,7 +307,6 @@ class ProxyApp:
             self._relayout_columns(event.width)
 
         self._resize_after_id = self.root.after(150, do_reflow)  # 150 ms delay
-
 
     def _tile_size_px(self):
         """Return approximate tile width used for column calculation."""
@@ -324,10 +373,8 @@ class ProxyApp:
                 "path": item["path"],
             })
 
-        # Force a reflow with current canvas width
-        self.inner.update_idletasks()
-        w = self.canvas.winfo_width() or self.inner.winfo_width()
-        self._relayout_columns(w)
+        # Defer measuring width & reflow until Tk is idle (prevents one mega-row)
+        self._force_reflow_after_idle()
 
     def _adjust_qty_fast(self, idx, delta):
         if 0 <= idx < len(self.items):
@@ -336,10 +383,10 @@ class ProxyApp:
                 # remove the card completely
                 self.items.pop(idx)
                 self._render_tiles_full()
+                self._force_reflow_after_idle()
             else:
                 self.items[idx]["qty"] = new_q
                 self.tiles[idx]["qty_var"].set(str(new_q))
-
 
     # ---- Clearing / PDF ----
     def clear_all(self):
@@ -349,6 +396,7 @@ class ProxyApp:
             self.items.clear()
             self.thumb_cache.clear()
             self._render_tiles_full()
+            self._force_reflow_after_idle()
             self.status.set("Cleared list.")
 
     def make_pdf(self):
